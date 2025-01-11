@@ -1,0 +1,48 @@
+# --- Modelos de la Base de Datos (SQLAlchemy) ---
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
+from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.ext.declarative import declarative_base
+import os
+from flask_sqlalchemy import SQLAlchemy
+from flask import Flask
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get("DATABASE_URL", 'postgresql://postgres:YOUR_POSTGRES_PASSWORD@localhost/academia_db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+Base = declarative_base()
+db = SQLAlchemy(app)
+
+class User(Base):
+   __tablename__ = 'users'
+   id = Column(Integer, primary_key=True)
+   username = Column(String, unique=True, nullable=False)
+   password = Column(String, nullable=False)
+
+class Curso(Base):
+   __tablename__ = 'cursos'
+   id = Column(Integer, primary_key=True)
+   nombre = Column(String, nullable=False)
+   profesor = Column(String, nullable=False)
+   estudiantes = relationship("Estudiante", back_populates="curso")
+
+class Estudiante(Base):
+    __tablename__ = 'estudiantes'
+    id = Column(Integer, primary_key=True)
+    nombre = Column(String, nullable=False)
+    curso_id = Column(Integer, ForeignKey('cursos.id'))
+    curso = relationship("Curso", back_populates="estudiantes")
+    calificaciones = relationship("Calificacion", back_populates="estudiante")
+
+class Calificacion(Base):
+    __tablename__ = 'calificaciones'
+    id = Column(Integer, primary_key=True)
+    estudiante_id = Column(Integer, ForeignKey('estudiantes.id'))
+    nota = Column(Float, nullable=False)
+    estudiante = relationship("Estudiante", back_populates="calificaciones")
+
+class KnowledgeBase(Base):
+    """Modelo para la tabla de conocimientos"""
+    __tablename__ = "knowledge_base"
+    id = Column(Integer, primary_key = True)
+    topic = Column(String, nullable = False)
+    content = Column(String, nullable=False)
