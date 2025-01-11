@@ -1,0 +1,703 @@
+import logging
+import uuid
+from datetime import datetime
+from typing import List, Dict, Any, Tuple, Optional
+import json
+import os
+from abc import ABC, abstractmethod
+import hashlib
+import hmac
+import time
+import base64
+import pyotp
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.backends import default_backend
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
+from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.ext.declarative import declarative_base
+import pandas as pd
+import seaborn as sns
+import io
+import base64
+import matplotlib.pyplot as plt
+import jwt
+import datetime
+from functools import wraps
+import requests
+from google.cloud import texttospeech as tts
+from google.cloud import speech_v2 as speech
+from transformers import pipeline
+import openai
+from google.cloud import vision
+from google.protobuf.json_format import MessageToJson
+
+# --- Configuración del logger ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Configuración de Google Cloud (se asume que las variables de entorno están configuradas) ---
+try:
+  tts_client = tts.TextToSpeechClient()
+  speech_client = speech.SpeechClient()
+  project_id = os.environ.get("GOOGLE_CLOUD_PROJECT_ID")
+  location = "global"
+  vision_client = vision.ImageAnnotatorClient()
+  logger.info("Google Cloud clients initialized successfully")
+except Exception as e:
+    logger.error(f"Error initializing Google Cloud clients: {e}")
+    raise
+
+# --- Configuración de la base de datos PostgreSQL ---
+db_host = os.environ.get("POSTGRES_HOST", "localhost")
+db_name = os.environ.get("POSTGRES_DB", "academia_db")
+db_user = os.environ.get("POSTGRES_USER", "postgres")
+db_password = os.environ.get("POSTGRES_PASSWORD", "YOUR_POSTGRES_PASSWORD")
+
+# --- Modelo de preguntas y respuestas ---
+try:
+  qa_pipeline = pipeline("question-answering", model="deepset/roberta-base-squad2")
+  logger.info("Transformers pipeline initialized successfully")
+except Exception as e:
+    logger.error(f"Error initializing Transformers pipeline: {e}")
+    raise
+
+openai.api_key = os.environ.get("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
+
+class Fact:
+    """Representa un hecho en el motor de inferencia."""
+    def __init__(self, description, confidence=1.0, source=""):
+        self.description = description
+        self.confidence = confidence
+        self.source = source
+        self.fact_id = uuid.uuid4()
+        self.creation_date = datetime.now()
+
+    def __str__(self):
+        return f"Fact(id={self.fact_id}, description={self.description}, confidence={self.confidence}, source={self.source})"
+
+class Rule:
+    """Representa una regla en el motor de inferencia."""
+    def __init__(self, condition, conclusion, confidence=1.0, rule_type=""):
+        self.condition = condition
+        self.conclusion = conclusion
+        self.confidence = confidence
+        self.rule_id = uuid.uuid4()
+        self.creation_date = datetime.now()
+        self.rule_type = rule_type
+
+    def __str__(self):
+      return f"Rule(id={self.rule_id}, condition={self.condition}, conclusion={self.conclusion}, confidence={self.confidence}, type={self.rule_type})"
+
+class InferenceEngine:
+    """Motor de inferencia para procesar hechos y reglas."""
+
+    def __init__(self):
+        """Inicializa el motor de inferencia."""
+        self.facts = {}
+        self.rules = []
+        self.logger = logging.getLogger(__name__)
+
+    def add_fact(self, fact: Fact):
+        """Agrega un hecho al motor de inferencia."""
+        try:
+            self.facts[fact.description] = fact
+            self.logger.info(f"Fact added: {fact}")
+        except Exception as e:
+            self.logger.error(f"Error adding fact: {e}")
+
+    def add_rule(self, rule: Rule):
+        """Agrega una regla al motor de inferencia."""
+        try:
+            self.rules.append(rule)
+            self.logger.info(f"Rule added: {rule}")
+        except Exception as e:
+            self.logger.error(f"Error adding rule: {e}")
+
+    def infer(self, query: str) -> List[Fact]:
+      """Realiza la inferencia basada en los hechos y reglas."""
+      self.logger.info(f"Starting inference process for query: {query}")
+      inferred_facts = []
+      try:
+        for rule in self.rules:
+            if rule.condition == query:
+                new_fact = Fact(rule.conclusion, confidence=rule.confidence, source="Inference")
+                if not self.facts.get(new_fact.description):
+                    self.add_fact(new_fact)
+                    inferred_facts.append(new_fact)
+                    self.logger.info(f"New fact inferred: {new_fact}")
+                else:
+                    self.logger.info(f"Fact already in database: {new_fact}")
+        self.logger.info("Inference process completed")
+        return inferred_facts
+      except Exception as e:
+          self.logger.error(f"Error during inference: {e}")
+          return []
+
+    def explain(self, query: str) -> str:
+        """Explica cómo se llegó a un hecho."""
+        self.logger.info(f"Explaining for query: {query}")
+        explanation = f"Explanation for query: {query}\n"
+        try:
+            for rule in self.rules:
+                 if rule.condition == query:
+                  explanation += f"Applying rule: {rule}\n"
+                  explanation += f"New fact inferred: {rule.conclusion}\n"
+                  self.logger.info(f"Rule applied for explanation: {rule}")
+            return explanation
+        except Exception as e:
+            self.logger.error(f"Error explaining fact: {e}")
+            return f"Error explaining fact: {e}"
+
+    def reset(self):
+        """Reinicia el motor de inferencia."""
+        try:
+            self.facts.clear()
+            self.rules.clear()
+            self.logger.info("Inference engine reset")
+        except Exception as e:
+            self.logger.error(f"Error resetting inference engine: {e}")
+
+    def get_facts(self):
+        """Devuelve todos los hechos."""
+        return self.facts.values()
+
+    def get_rules(self):
+        """Devuelve todas las reglas."""
+        return self.rules
+
+class Plan:
+    """Representa un plan de acción, compuesto por una serie de pasos."""
+
+    def __init__(self, objective, steps=None, plan_id=None, creation_date=None):
+        """Inicializa un nuevo plan."""
+        self.objective = objective
+        self.steps = steps if steps is not None else []
+        self.plan_id = plan_id if plan_id is not None else uuid.uuid4()
+        self.creation_date = creation_date if creation_date is not None else datetime.now()
+        self.history = []
+        self.logger = logging.getLogger(__name__)
+
+    def add_step(self, step):
+        """Agrega un nuevo paso al plan."""
+        self.steps.append(step)
+        self.history.append(f"Step added: {step}")
+        self.logger.info(f"Step added to plan {self.plan_id}: {step}")
+
+    def remove_step(self, step):
+        """Elimina un paso del plan."""
+        try:
+            self.steps.remove(step)
+            self.history.append(f"Step removed: {step}")
+            self.logger.info(f"Step removed from plan {self.plan_id}: {step}")
+        except ValueError:
+            self.logger.warning(f"Can't remove step {step} from plan {self.plan_id} because it doesn't exist")
+
+    def get_steps(self):
+        """Obtiene todos los pasos del plan, ordenados por prioridad."""
+        return sorted(self.steps, key=lambda step: step.prioridad)
+
+    def __str__(self):
+         return f"Plan ID: {self.plan_id}\nObjective: {self.objective}\nSteps: {', '.join(step.__str__() for step in self.get_steps())}"
+
+class Step:
+    """Representa un paso específico dentro de un plan."""
+
+    def __init__(self, description, due_date=None, completed=False, step_id=None, creation_date=None, prioridad=1, recursos=None, dependencias=None):
+        """Inicializa un nuevo paso."""
+        self.description = description
+        self.due_date = due_date
+        self.completed = completed
+        self.step_id = step_id if step_id is not None else uuid.uuid4()
+        self.creation_date = creation_date if creation_date is not None else datetime.now()
+        self.prioridad = prioridad
+        self.recursos = recursos if recursos is not None else []
+        self.dependencias = dependencias if dependencias is not None else []
+
+    def mark_as_complete(self):
+        """Marca el paso como completado."""
+        self.completed = True
+
+    def mark_as_incomplete(self):
+        """Marca el paso como incompleto"""
+        self.completed = False
+
+    def get_status(self):
+        """Retorna el estado del paso"""
+        return "Complete" if self.completed else "Incomplete"
+
+    def __str__(self):
+        return f"Step ID: {self.step_id} - {self.description} - Status: {self.get_status()} - Priority: {self.prioridad} - Resources: {self.recursos} - Dependencies:{self.dependencias}"
+
+class Planner:
+    """Responsable de crear y gestionar los planes de acción."""
+
+    def __init__(self):
+        """Inicializa el planificador"""
+        self.plans = {}
+        self.logger = logging.getLogger(__name__)
+
+    def create_plan(self, objective, steps):
+        """Crea un nuevo plan de acción."""
+        plan = Plan(objective=objective, steps=steps)
+        self.plans[plan.plan_id] = plan
+        self.logger.info(f"New plan created: {plan}")
+        return plan
+
+    def get_plan(self, plan_id):
+        """Obtiene un plan por su ID."""
+        plan = self.plans.get(plan_id)
+        if plan:
+            self.logger.info(f"Plan {plan_id} retrieved successfully")
+            return plan
+        else:
+            self.logger.warning(f"Plan {plan_id} not found")
+            return None
+
+    def update_plan(self, plan_id, new_steps):
+        """Actualiza los pasos de un plan"""
+        plan = self.get_plan(plan_id)
+        if plan:
+            plan.steps = new_steps
+            plan.history.append(f"Plan updated with new steps: {new_steps}")
+            self.logger.info(f"Plan {plan_id} updated successfully")
+            return plan
+        else:
+            self.logger.warning(f"Can't update plan {plan_id} because it doesn't exist")
+            return None
+
+    def get_all_plans(self):
+        """Obtiene todos los planes"""
+        return self.plans.values()
+
+    def generate_simple_plan(self, objective, number_of_steps=3):
+        """Genera un plan básico con un número de pasos dados"""
+        steps = [Step(f"Step {i+1} for {objective}") for i in range(number_of_steps)]
+        plan = self.create_plan(objective=objective, steps=steps)
+        self.logger.info(f"Simple plan generated {plan}")
+        return plan
+
+    def delete_plan(self, plan_id):
+        """Elimina un plan dado su id"""
+        plan = self.get_plan(plan_id)
+        if plan:
+            del self.plans[plan_id]
+            self.logger.info(f"Plan {plan_id} deleted successfully")
+            return True
+        else:
+            self.logger.warning(f"Can't delete plan {plan_id} because it doesn't exist")
+            return False
+
+    def check_dependencies(self, plan:Plan, step: Step) -> bool:
+       """Verifica si se cumplen las dependencias de un paso de un plan dado"""
+       if not step.dependencias:
+          return True
+       for dependency_id in step.dependencias:
+          dependency_step = next((s for s in plan.steps if s.step_id == dependency_id),None)
+          if not dependency_step or not dependency_step.completed:
+             self.logger.warning(f"Dependency not met for step {step.step_id}, dependency is {dependency_id}")
+             return False
+       self.logger.info(f"All dependencies met for step {step.step_id}")
+       return True
+
+class LearningModule(ABC):
+    """Abstract base class for different learning modules."""
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+
+    @abstractmethod
+    def train(self, data:Any):
+        """Trains the learning module"""
+        pass
+
+    @abstractmethod
+    def predict(self, data:Any):
+        """Predicts a result based on what it learns."""
+        pass
+
+    @abstractmethod
+    def evaluate(self, data:Any):
+        """Evaluates the learning module"""
+        pass
+
+class ReinforcementLearningModule(LearningModule):
+    """Implements reinforcement learning"""
+    def __init__(self, reward_system, learning_rate=0.1, discount_factor=0.9, exploration_rate=0.2):
+        super().__init__()
+        self.reward_system = reward_system
+        self.q_table = {}
+        self.learning_rate = learning_rate
+        self.discount_factor = discount_factor
+        self.exploration_rate = exploration_rate
+        self.logger = logging.getLogger(__name__)
+
+
+    def train(self, data: Tuple[Any,str,float,Any]):
+        """Trains the reinforcement learning module."""
+        state, action, reward, next_state = data
+        if (state, action) not in self.q_table:
+            self.q_table[(state, action)] = 0.0
+        
+        best_next_action = self.predict(next_state, explore=False)
+        if best_next_action and (next_state,best_next_action) in self.q_table:
+             q_next = self.q_table[(next_state,best_next_action)]
+        else:
+            q_next = 0
+        self.q_table[(state, action)] = self.q_table[(state, action)] + self.learning_rate * (
+                reward + self.discount_factor * q_next - self.q_table[(state, action)]
+            )
+        self.logger.info(f"Reinforcement learning training with: {data}, q_value:{self.q_table[(state, action)]}")
+
+    def predict(self, state: Any, explore=True) -> Optional[str]:
+        """Predicts an action based on the current state, using exploration if explore=True"""
+        possible_actions = self.reward_system.get_possible_actions(state)
+        if not possible_actions:
+           return None
+        if explore and random.random() < self.exploration_rate:
+           best_action = random.choice(possible_actions)
+           self.logger.info(f"Exploring action: {best_action} on state: {state}")
+           return best_action
+        else:
+           best_action = None
+           best_value = float('-inf')
+           for action in possible_actions:
+              if (state, action) in self.q_table:
+                value = self.q_table[(state, action)]
+                if value > best_value:
+                    best_value = value
+                    best_action = action
+           self.logger.info(f"Best action selected: {best_action} with q_value: {best_value} on state:{state}")
+           return best_action
+
+    def evaluate(self, data: Any):
+        """Evaluates the module."""
+        self.logger.info(f"Reinforcement learning module evaluated with {data}")
+
+    def get_best_action(self, state: Any) -> Optional[str]:
+      """Returns the best action for a given state"""
+      return self.predict(state, explore=False)
+
+class RewardSystem(ABC):
+    """Abstract base class for reward systems"""
+    @abstractmethod
+    def get_possible_actions(self, state: Any) -> List[str]:
+        """Gets all possible actions for a given state"""
+        pass
+
+class SimpleRewardSystem(RewardSystem):
+  """A simple implementation of a Reward system"""
+  def get_possible_actions(self, state:Any) -> List[str]:
+    return ["create","update", "delete", "view", "infer", "explain", "reset"]
+
+class SupervisedLearningModule(LearningModule):
+      """Implements supervised learning"""
+      def __init__(self):
+          super().__init__()
+          self.model = {}
+
+      def train(self, data: Dict[str,Any]):
+           """Trains the supervised learning module"""
+           #implementacion simplificada
+           input_data = data.get("input")
+           output_data = data.get("output")
+           if input_data and output_data:
+              self.model[input_data] = output_data
+              self.logger.info(f"Supervised learning model trained with {data}")
+           else:
+             self.logger.warning("Incorrect data format in training supervised learning model")
+
+      def predict(self, data: str) -> str:
+        """Predicts an output based on the input."""
+        return self.model.get(data, "Default output")
+
+      def evaluate(self, data: Any):
+          """Evaluates the module."""
+          self.logger.info(f"Supervised learning model evaluated with {data}")
+
+class CodeApprovalSystem:
+    """Sistema de aprobación humana para los cambios de código"""
+    def __init__(self):
+         self.pending_proposals = {}
+         self.logger = logging.getLogger(__name__)
+         self.secret_key = os.environ.get("SECRET_KEY_APPROVAL", "YOUR_SECRET_KEY_APPROVAL")
+         self.salt = os.environ.get("SALT_KEY_APPROVAL", "YOUR_SALT_KEY_APPROVAL")
+
+    def _hash_password(self, password):
+        """Hashes a password for secure storage"""
+        salt = self.salt.encode()
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+            backend=default_backend()
+            )
+        key = kdf.derive(password.encode())
+        return base64.urlsafe_b64encode(key).decode()
+
+    def _generate_totp_secret(self):
+       """Generates a new TOTP secret"""
+       return base64.b32encode(os.urandom(10)).decode('utf-8')
+
+    def _generate_totp_uri(self, secret, username):
+       """Generates a new TOTP URI for use in authenticator applications"""
+       return pyotp.TOTP(secret).provisioning_uri(name=username, issuer_name="Aura")
+
+    def _verify_totp(self, secret, token):
+       """Verifies a given TOTP token"""
+       totp = pyotp.TOTP(secret)
+       return totp.verify(token)
+
+    def create_proposal(self, change, description=""):
+         """Crea una nueva propuesta de modificación de código."""
+         proposal_id = uuid.uuid4()
+         self.pending_proposals[proposal_id] = {
+           "change": change,
+           "description": description,
+           "status": "pending",
+           "creation_date": datetime.now()
+          }
+         self.logger.info(f"New proposal created {proposal_id}, for change: {change}")
+         return proposal_id
+
+    def get_proposal(self, proposal_id):
+      """Obtiene una propuesta dada su id"""
+      proposal = self.pending_proposals.get(proposal_id)
+      if proposal:
+          self.logger.info(f"Proposal {proposal_id} retrieved succesfully")
+          return proposal
+      else:
+         self.logger.warning(f"Proposal {proposal_id} not found")
+         return None
+
+    def approve_proposal(self, proposal_id, password, token):
+        """Aprueba una propuesta de modificación de código."""
+        proposal = self.get_proposal(proposal_id)
+        if not proposal:
+           self.logger.warning(f"Can't approve proposal {proposal_id}, proposal not found")
+           return False
+        hashed_password = self._hash_password(password)
+        if hashed_password == self.secret_key and self._verify_totp(self.salt, token):
+             proposal["status"] = "approved"
+             self.logger.info(f"Proposal {proposal_id} approved successfully")
+             return True
+        else:
+           self.logger.warning(f"Can't approve proposal {proposal_id}, user not authenticated or token invalid")
+           return False
+
+    def reject_proposal(self, proposal_id):
+        """Rechaza una propuesta de modificación de código."""
+        proposal = self.get_proposal(proposal_id)
+        if not proposal:
+           self.logger.warning(f"Can't reject proposal {proposal_id}, proposal not found")
+           return False
+        proposal["status"] = "rejected"
+        self.logger.info(f"Proposal {proposal_id} rejected")
+        return True
+
+    def get_all_proposals(self):
+        """Obtiene todas las propuestas."""
+        return self.pending_proposals.values()
+
+    def get_pending_proposals(self):
+        """Obtiene todas las propuestas pendientes"""
+        return [proposal for proposal in self.pending_proposals.values() if proposal["status"] == "pending"]
+
+    def reset_system(self):
+       """Resetea el sistema de aprobaciones"""
+       self.pending_proposals.clear()
+       self.logger.info("Code approval system reset")
+
+class Core:
+    """Núcleo de Aura, donde se coordinan el planificador, el motor de inferencia y el sistema de aprobación."""
+
+    def __init__(self):
+        """Inicializa el núcleo de Aura."""
+        self.planner = Planner()
+        self.inference_engine = InferenceEngine()
+        self.code_approval_system = CodeApprovalSystem()
+        self.reward_system = SimpleRewardSystem()
+        self.learning_module = ReinforcementLearningModule(reward_system=self.reward_system)
+        self.supervised_learning_module = SupervisedLearningModule()
+        self.logger = logging.getLogger(__name__)
+
+    def create_plan(self, objective, steps):
+      """Crea un nuevo plan de acción."""
+      try:
+        plan = self.planner.create_plan(objective, steps)
+        self.logger.info("Plan created successfully")
+        return plan
+      except Exception as e:
+        self.logger.error(f"Error creating plan, {e}")
+        return None
+
+    def infer_facts(self, query: str):
+        """Realiza inferencias basadas en hechos y reglas."""
+        try:
+            facts = self.inference_engine.infer(query=query)
+            self.logger.info(f"Facts inferred successfully for query {query}: {facts}")
+            return facts
+        except Exception as e:
+             self.logger.error(f"Error inferring facts for query: {query}, {e}")
+             return []
+
+    def explain_reasoning(self, fact):
+        """Explica cómo se llegó a un hecho"""
+        try:
+            explanation = self.inference_engine.explain(fact)
+            self.logger.info(f"Explanation generated: {explanation}")
+            return explanation
+        except Exception as e:
+            self.logger.error(f"Error explaining reasoning: {e}")
+            return f"Error explaining reasoning {e}"
+
+    def add_fact(self, fact):
+        """Agrega un hecho al motor de inferencia"""
+        try:
+           self.inference_engine.add_fact(fact)
+           self.logger.info(f"Fact added: {fact}")
+        except Exception as e:
+           self.logger.error(f"Error adding fact: {e}")
+
+    def add_rule(self, rule):
+        """Agrega una regla al motor de inferencia"""
+        try:
+            self.inference_engine.add_rule(rule)
+            self.logger.info(f"Rule added: {rule}")
+        except Exception as e:
+            self.logger.error(f"Error adding rule: {e}")
+
+    def reset_knowledge(self):
+       """Resetea la base de conocimientos del motor de inferencia"""
+       try:
+           self.inference_engine.reset()
+           self.logger.info("Knowledge reset successfully")
+       except Exception as e:
+           self.logger.error(f"Error resetting knowledge: {e}")
+
+    def get_all_plans(self):
+        """Obtiene todos los planes del planificador"""
+        return self.planner.get_all_plans()
+
+    def check_dependencies(self, plan:Plan, step: Step) -> bool:
+        """Verifica las dependencias de un paso de un plan dado"""
+        return self.planner.check_dependencies(plan,step)
+
+    def create_code_proposal(self, change, description=""):
+        """Crea una nueva propuesta de modificación de código."""
+        try:
+            proposal_id = self.code_approval_system.create_proposal(change, description)
+            self.logger.info(f"Code proposal created successfully: {proposal_id}")
+            return proposal_id
+        except Exception as e:
+            self.logger.error(f"Error creating code proposal: {e}")
+            return None
+
+    def approve_code_proposal(self, proposal_id, password, token):
+        """Aprueba una propuesta de modificación de código."""
+        try:
+            approved = self.code_approval_system.approve_proposal(proposal_id, password, token)
+            if approved:
+               self.logger.info(f"Code proposal {proposal_id} approved successfully")
+            else:
+              self.logger.warning(f"Code proposal {proposal_id} rejected or not found")
+            return approved
+        except Exception as e:
+             self.logger.error(f"Error approving proposal {proposal_id}: {e}")
+             return False
+
+    def reject_code_proposal(self, proposal_id):
+        """Rechaza una propuesta de modificación de código."""
+        try:
+          rejected = self.code_approval_system.reject_proposal(proposal_id)
+          if rejected:
+              self.logger.info(f"Code proposal {proposal_id} rejected successfully")
+          else:
+              self.logger.warning(f"Code proposal {proposal_id} could not be rejected")
+          return rejected
+        except Exception as e:
+          self.logger.error(f"Error rejecting proposal: {e}")
+          return False
+
+    def get_pending_code_proposals(self):
+        """Obtiene todas las propuestas de código pendientes."""
+        return self.code_approval_system.get_pending_proposals()
+
+    def train_reinforcement_learning(self, data):
+        """Trains the reinforcement learning module"""
+        try:
+            self.learning_module.train(data)
+            self.logger.info(f"Reinforcement learning model trained with: {data}")
+        except Exception as e:
+           self.logger.error(f"Error in the reinforcement learning model training: {e}")
+
+    def predict_reinforcement_learning(self, state):
+       """Predicts the best action based on reinforcement learning model"""
+       try:
+         best_action = self.learning_module.get_best_action(state)
+         self.logger.info(f"Best action from reinforcement learning model: {best_action} for state: {state}")
+         return best_action
+       except Exception as e:
+         self.logger.error(f"Error in the reinforcement learning model prediction: {e}")
+         return None
+    
+    def train_supervised_learning(self, data):
+         """Trains the supervised learning model"""
+         try:
+           self.supervised_learning_module.train(data)
+           self.logger.info(f"Supervised learning model trained with data: {data}")
+         except Exception as e:
+           self.logger.error(f"Error in the supervised learning model training: {e}")
+
+    def predict_supervised_learning(self, data: str):
+         """Predicts the best action based on the supervised learning model"""
+         try:
+           output = self.supervised_learning_module.predict(data)
+           self.logger.info(f"Supervised learning model prediction with input:{data}, generated output:{output}")
+           return output
+         except Exception as e:
+           self.logger.error(f"Error in the supervised learning model prediction: {e}")
+           return None
+
+    def reset_code_approval_system(self):
+       """Resets the approval system"""
+       try:
+         self.code_approval_system.reset_system()
+         self.logger.info("Code approval system reset")
+       except Exception as e:
+          self.logger.error(f"Error resetting the code approval system:{e}")
+
+    def text_to_speech_google(self, text, language="es-ES"):
+        """Convierte texto a voz usando Google Cloud TTS."""
+        try:
+            synthesis_input = tts.SynthesisInput(text=text)
+            voice = tts.VoiceSelectionParams(language_code=language, ssml_gender=tts.SsmlVoiceGender.FEMALE)
+            audio_config = tts.AudioConfig(audio_encoding=tts.AudioEncoding.LINEAR16)
+            response = tts_client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
+            logger.info("Text converted to speech successfully")
+            return response.audio_content
+        except Exception as e:
+            logger.error(f"Error converting text to speech: {e}")
+            return None
+
+    def speech_to_text_google(self, audio_content,language="es-ES"):
+        """Convierte audio a texto usando Google Cloud Speech-to-Text."""
+        try:
+            config = speech.RecognitionConfig(
+                auto_decoding=True,
+                language_codes=[language],
+            )
+            request_config = speech.RecognizeRequest.config
+            request_config = config
+
+            request = speech.RecognizeRequest(
+                audio=speech.RecognitionAudio(content=audio_content),
+                config=request_config
+            )
+            response = speech_client.recognize(request=request)
+            if len(response.results) > 0 :
+                logger.info("Speech converted to text successfully")
