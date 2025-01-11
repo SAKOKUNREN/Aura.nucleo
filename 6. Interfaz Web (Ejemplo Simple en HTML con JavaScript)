@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Aura Interface</title>
+    <style>
+        body { font-family: sans-serif; }
+        button { margin: 5px; padding: 10px; }
+        textarea { width: 80%; height: 100px; margin: 5px; }
+        #response { margin: 10px; padding: 10px; border: 1px solid #ccc; }
+    </style>
+</head>
+<body>
+    <h2>Aura Interface</h2>
+    <textarea id="queryInput" placeholder="Escribe tu pregunta aquí"></textarea><br>
+    <button onclick="sendTextQuery()">Enviar Texto</button>
+    <button onclick="startVoiceQuery()">Enviar Voz</button>
+     <input type="file" id="imageInput" accept="image/*"><br>
+    <button onclick="sendImageQuery()">Enviar Imagen</button>
+    <button onclick="startSearchQuery()">Buscar en internet</button><br>
+    <div id="response"></div>
+    <audio id="audioOutput" controls></audio>
+     <script>
+      const audioOutput = document.getElementById('audioOutput');
+       let mediaRecorder;
+       let audioChunks = [];
+
+     function sendTextQuery() {
+         const query = document.getElementById('queryInput').value;
+        fetchData("text", query);
+     }
+
+     function startVoiceQuery(){
+        navigator.mediaDevices.getUserMedia({audio:true})
+         .then(stream =>{
+            mediaRecorder = new MediaRecorder(stream);
+            mediaRecorder.ondataavailable = event => {
+                audioChunks.push(event.data);
+            };
+
+            mediaRecorder.onstop = () => {
+               const audioBlob = new Blob(audioChunks, {type: 'audio/wav'});
+                const reader = new FileReader()
+                reader.onloadend = () => {
+                     const audioBase64 = reader.result.split(',')[1];
+                      fetchData("voice", null, audioBase64);
+                };
+                reader.readAsDataURL(audioBlob)
+                audioChunks = [];
+            };
+          mediaRecorder.start();
+         })
+         .catch(e =>{
+             document.getElementById("response").innerText = "Error al capturar audio"
+         })
+      }
+      function sendImageQuery(){
+          const imageInput = document.getElementById('imageInput');
+          const file = imageInput.files[0];
+          if (file){
+              const reader = new FileReader();
+              reader.onloadend = () => {
+                  const imageBase64 = reader.result.split(',')[1]
+                  fetchData("image", null, null, imageBase64)
+              }
+              reader.readAsDataURL(file);
+          }else{
+              document.getElementById("response").innerText = "Selecciona una imagen"
+          }
+      }
+
+    function startSearchQuery(){
+        const query = document.getElementById('queryInput').value
+        fetchData("search", query)
+    }
+
+    function fetchData(mode, query, audio=null, image=null) {
+        document.getElementById("response").innerText = "Cargando...";
+
+         const data = {
+              "mode": mode,
+              "query": query,
+              "audio": audio,
+              "image": image
+          };
+          fetch('http://127.0.0.1:5000/ask', {
+              method: 'POST',
+              headers: {
+                  'Content-Type': 'application/json',
+                 'Authorization': localStorage.getItem('token')
+              },
+             body: JSON.stringify(data)
+           }).then(response => {
+             if(response.status === 401){
+               alert("Usuario no autenticado")
+               localStorage.removeItem('token')
+             }
+             return response.json()
+             })
+           .then(data => {
+              if (data.error){
+                 document.getElementById("response").innerText = data.error;
+                 audioOutput.src = "";
+               }
+               else if (data.image_analysis) {
+                   document.getElementById("response").innerText = JSON.stringify(data.image_analysis);
+                    audioOutput.src = "";
+               }
+               else if (data.results) {
+                   document.getElementById("response").innerText = JSON.stringify(data.results);
+                    audioOutput.src = "";
+               }
+               else {
+                 document.getElementById("response").innerText = data.answer;
+                 if (data.audio){
+                      audioOutput.src = "data:audio/wav;base64," + data.audio
+                   }
+               }
+            })
+          .catch(e => {
+                document.getElementById("response").innerText = "Error al procesar la petición"
+           });
+    }
+
+   function login(){
+        const auth = window.btoa('admin:password')
+        fetch('http://localhost:5000/login', {
+            method: 'POST',
+             headers: {
+              'Authorization': `Basic ${auth}`
+            }
+        }).then(response => response.json())
+        .then(data => {
+            localStorage.setItem('token', data.token)
+         })
+        .catch(e => {
+            alert('Error al iniciar sesión')
+         })
+   }
+   login()
+     </script>
+</body>
+</html>
