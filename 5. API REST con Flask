@@ -1,0 +1,114 @@
+# --- Configuración de Flask ---
+app = Flask(__name__)
+CORS(app)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get("DATABASE_URL", 'postgresql://postgres:YOUR_POSTGRES_PASSWORD@localhost/academia_db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SECRET_KEY'] = os.environ.get("SECRET_KEY", 'YOUR_SECRET_KEY') #Clave secreta para JWT
+Base = declarative_base()
+db = SQLAlchemy(app)
+
+# --- Autenticacion JWT ----
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({"message":"Token is missing!"}),401
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+        except:
+            return jsonify({"message": "Token is invalid"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route('/login', methods=['POST'])
+def login():
+    auth = request.authorization
+    if not auth or not auth.username or not auth.password:
+        return jsonify({"message": "Could not verify"}), 401
+    # Aqui se verifica el usuario, simulamos por ahora
+    if auth.username == 'admin' and auth.password == 'password':
+        token = jwt.encode({'user':auth.username,'exp':datetime.datetime.utcnow() + datetime.timedelta(minutes=30)}, app.config['SECRET_KEY'], algorithm="HS256")
+        return jsonify({"token":token})
+    return jsonify({"message": "Could not verify"}), 401
+
+
+# --- Rutas de la API ---
+@app.route('/ask', methods=['POST'])
+@token_required
+def ask_aura():
+    """Endpoint principal para interactuar con Aura."""
+    try:
+        core = Core()
+        data = request.get_json()
+        mode = data.get('mode')
+        query = data.get("query")
+        if not query and mode != "image":
+           return jsonify({"error":"No se especificó una consulta"})
+
+        if mode == "text":
+            answer = core.predict_supervised_learning(query)
+            if not answer:
+               context = "Este es el contexto del curso: ..." #Aquí iría el contexto real
+               answer = qa_pipeline(question=query, context=context)['answer']
+            audio_response = core.text_to_speech_google(answer)
+            if audio_response:
+               audio_base64 = base64.b64encode(audio_response).decode('utf-8')
+               return jsonify({"answer":answer,"audio": audio_base64 })
+            else:
+               return jsonify({"answer":answer})
+        elif mode == "voice":
+             audio_bytes = base64.b64decode(data.get("audio"))
+             question = core.speech_to_text_google(audio_bytes)
+             if question == "Error al reconocer el audio":
+                 return jsonify({"error":question})
+             else:
+                 answer = core.predict_supervised_learning(question)
+                 if not answer:
+                   context = "Este es el contexto del curso: ..." #Aquí iría el contexto real
+                   answer = qa_pipeline(question=question, context=context)['answer']
+                 audio_response = core.text_to_speech_google(answer)
+                 if audio_response:
+                     audio_base64 = base64.b64encode(audio_response).decode('utf-8')
+                     return jsonify({"answer":answer,"audio": audio_base64 })
+                 else:
+                     return jsonify({"answer":answer})
+        elif mode == "image":
+            image_bytes = base64.b64decode(data.get("image"))
+            analysis = core.analyze_image(image_bytes)
+            return jsonify({"image_analysis":analysis})
+        elif mode == "search":
+            results = core.search_internet(query)
+            return jsonify({"results":results})
+        else:
+             return jsonify({"error":"Modo no válido"})
+
+    except Exception as e:
+          return jsonify({"error": "Error interno del servidor"}), 500
+
+@app.route('/proposals', methods=['GET'])
+@token_required
+def get_proposals():
+     """Obtiene las propuestas pendientes"""
+     core = Core()
+     proposals = core.get_pending_code_proposals()
+     return jsonify(proposals)
+
+@app.route('/proposals/<proposal_id>', methods=['POST'])
+@token_required
+def approve_proposals(proposal_id):
+     """Aprueba una propuesta dado el id"""
+     core = Core()
+     data = request.get_json()
+     password = data.get('password')
+     token = data.get('token')
+     approved = core.approve_code_proposal(proposal_id, password, token)
+     if approved:
+        return jsonify({"message": "Proposal approved"})
+     else:
+       return jsonify({"error": "Can't approve proposal"})
+
+if __name__ == '__main__':
+    engine = create_engine(app.config['SQLALCHEMY_DATABASE_URI'])
+    Base.metadata.create_all(engine)
+    app.run(debug=True, port=5000)
